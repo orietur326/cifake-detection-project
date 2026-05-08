@@ -79,13 +79,28 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if args.fast_dev_run:
+        if args.max_train_each is None:
+            args.max_train_each = 20
+        if args.max_test_each is None:
+            args.max_test_each = 20
+        args.epochs = 1
+        args.batch_size = 8
+        args.num_workers = 0
+        print(
+            "fast_dev_run enabled with overrides: "
+            f"max_train_each={args.max_train_each}, max_test_each={args.max_test_each}, "
+            f"epochs={args.epochs}, batch_size={args.batch_size}, num_workers={args.num_workers}"
+        )
+
     set_seed(args.seed)
     output_dir = ensure_dir(args.output_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_samples, _ = load_cifake_samples(
+    train_samples, test_samples = load_cifake_samples(
         data_dir=args.data_dir,
         max_train_each=args.max_train_each,
         max_test_each=args.max_test_each,
@@ -94,9 +109,9 @@ def main() -> None:
     )
     train_split, val_split = split_train_val(train_samples, val_size=0.2, seed=args.seed)
 
-    if args.fast_dev_run:
-        train_split = train_split[:32]
-        val_split = val_split[:16]
+    print(
+        f"Split sample counts -> train: {len(train_split)}, val: {len(val_split)}, test: {len(test_samples)}"
+    )
 
     transform = transforms.Compose([transforms.ToTensor()])
     train_ds = CIFAKEDataset(train_split, transform=transform)
@@ -117,6 +132,11 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
+    print(
+        f"DataLoader config -> batch_size={args.batch_size}, num_workers={args.num_workers}, "
+        f"train_batches={len(train_loader)}, val_batches={len(val_loader)}"
+    )
+
     model = build_resnet18_cifake(num_classes=2).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -124,6 +144,8 @@ def main() -> None:
     best_val_f1 = -1.0
     log_rows: list[dict] = []
     ckpt_path = output_dir / "best_resnet18.pth"
+
+    print(f"Starting training loop. First epoch will be: 1/{args.epochs}")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -172,9 +194,6 @@ def main() -> None:
             best_val_f1 = val_metrics["f1"]
             torch.save(model.state_dict(), ckpt_path)
             print(f"Saved improved checkpoint to: {ckpt_path}")
-
-        if args.fast_dev_run:
-            break
 
     log_df = pd.DataFrame(log_rows)
     log_path = output_dir / "training_log.csv"
