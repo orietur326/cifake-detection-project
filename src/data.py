@@ -37,7 +37,10 @@ def _collect_split(data_dir: Path, split: str, max_each: Optional[int], seed: in
         if not class_dir.exists():
             continue
         class_paths = list_image_files(class_dir)
+        print(f"Collected {len(class_paths)} file paths for {split}/{class_name} before limiting.")
         class_paths = _sample_paths(class_paths, max_each, seed)
+        if max_each is not None:
+            print(f"Using {len(class_paths)} file paths for {split}/{class_name} after max_each={max_each}.")
         samples.extend(Sample(image_path=p, label=label_idx) for p in class_paths)
     return samples
 
@@ -51,6 +54,7 @@ def validate_cifake_dirs(data_dir: Path) -> None:
         raise FileNotFoundError(
             f"Missing CIFAKE folders under data_dir={data_dir}. Expected:\n{details}"
         )
+    print(f"Validated CIFAKE directory structure at: {data_dir}")
 
 
 def load_cifake_samples(
@@ -70,11 +74,18 @@ def load_cifake_samples(
     set_seed(seed)
 
     if fast_dev_run:
-        max_train_each = min(max_train_each or 16, 16)
-        max_test_each = min(max_test_each or 8, 8)
+        max_train_each = min(max_train_each or 20, 20)
+        max_test_each = min(max_test_each or 20, 20)
+        print(
+            "fast_dev_run enabled in data loading: "
+            f"max_train_each={max_train_each}, max_test_each={max_test_each}"
+        )
 
     train_samples = _collect_split(data_dir, TRAIN_SPLIT_NAME, max_train_each, seed)
     test_samples = _collect_split(data_dir, TEST_SPLIT_NAME, max_test_each, seed)
+    print(
+        f"Collected sample counts -> train: {len(train_samples)}, test: {len(test_samples)}"
+    )
     return train_samples, test_samples
 
 
