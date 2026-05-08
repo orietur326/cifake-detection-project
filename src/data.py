@@ -33,14 +33,14 @@ def _sample_paths(paths: list[Path], max_count: Optional[int], seed: int) -> lis
 def _collect_split(data_dir: Path, split: str, max_each: Optional[int], seed: int) -> list[Sample]:
     samples: list[Sample] = []
     for class_name, label_idx in LABEL_TO_INDEX.items():
+        print(f"collecting {split} {class_name}")
         class_dir = data_dir / split / class_name
         if not class_dir.exists():
+            print(f"collected {split} {class_name}: 0")
             continue
-        class_paths = list_image_files(class_dir)
-        print(f"Collected {len(class_paths)} file paths for {split}/{class_name} before limiting.")
+        class_paths = list_image_files(class_dir, max_files=max_each)
         class_paths = _sample_paths(class_paths, max_each, seed)
-        if max_each is not None:
-            print(f"Using {len(class_paths)} file paths for {split}/{class_name} after max_each={max_each}.")
+        print(f"collected {split} {class_name}: {len(class_paths)}")
         samples.extend(Sample(image_path=p, label=label_idx) for p in class_paths)
     return samples
 
