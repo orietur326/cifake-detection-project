@@ -16,7 +16,82 @@ Dataset:
 
 ## Existing Work
 
-A group member has completed Part 1 in:
+A group member has completed Part 1 in `notebooks/ML_GW_part1.ipynb`.
+
+Part 1 includes:
+- Loading CIFAKE train and test images
+- EDA visualization
+- FFT and DCT frequency-domain visualization
+- Handcrafted feature extraction:
+  - DCT coefficients: 1024 dimensions
+  - FFT radial power spectrum statistics: 32 dimensions
+  - RGB color histogram: 96 dimensions
+- Total feature vector: 1152 dimensions
+- ML classifiers:
+  - Logistic Regression
+  - LinearSVC
+  - XGBoost
+- Clean test evaluation
+- Robustness evaluation under:
+  - JPEG compression: quality 75, 50, 25
+  - Gaussian blur: sigma 1, 2, 3
+  - Gaussian noise: sigma 0.05, 0.10, 0.20
+
+## New Task
+
+Implement Part 2:
+- ResNet-18 deep learning baseline
+- Clean test evaluation
+- Robustness evaluation using the same corruption settings
+- Final comparison with Logistic Regression, LinearSVC, XGBoost, and ResNet-18
+
+## Coding Rules
+
+- Do not overwrite the original notebook.
+- Keep the original notebook under `notebooks/`.
+- Put new Python code under `src/`.
+- Make paths configurable.
+- Do not hardcode local paths.
+- Do not upload or commit the Kaggle dataset.
+- Add `--fast_dev_run` mode for quick debugging.
+- Save metrics as CSV.
+- Save plots as PNG.
+- Use random seed 42.
+- Use GPU if available.
+- Keep code readable for a university group project.
+
+## Expected Project Structure
 
 ```text
-notebooks/ML_GW_part1.ipynb
+cifake-detection-project/
+│
+├── AGENTS.md
+├── README.md
+├── requirements.txt
+├── .gitignore
+│
+├── notebooks/
+│   └── ML_GW_part1.ipynb
+│
+├── assets/
+│   └── workflow.jpg
+│
+├── src/
+│   ├── config.py
+│   ├── data.py
+│   ├── corruptions.py
+│   ├── metrics.py
+│   ├── models.py
+│   ├── train_resnet18.py
+│   ├── eval_resnet18.py
+│   ├── eval_resnet18_robustness.py
+│   ├── plot_results.py
+│   └── utils.py
+│
+├── outputs/
+│   ├── ml_baseline/
+│   ├── resnet18/
+│   └── final_comparison/
+│
+└── report/
+    └── results_summary.md
