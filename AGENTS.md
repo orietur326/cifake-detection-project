@@ -2,7 +2,7 @@
 
 ## Project Context
 
-This project is a group machine learning project using the Kaggle CIFAKE dataset.
+This repository contains a university group machine learning project using the Kaggle CIFAKE dataset.
 
 Dataset:
 - CIFAKE: Real and AI-Generated Synthetic Images
@@ -14,11 +14,21 @@ Dataset:
   - REAL = 0
   - FAKE = 1
 
-## Existing Work
+The original group member's notebook is located at:
 
-A group member has completed Part 1 in `notebooks/ML_GW_part1.ipynb`.
+```text
+notebooks/ML_GW_part1.ipynb
+```
 
-Part 1 includes:
+Do not modify this original notebook unless the user explicitly asks.
+
+---
+
+## Existing Work: Part 1 ML Baseline
+
+Part 1 has already been completed in the original notebook.
+
+It includes:
 - Loading CIFAKE train and test images
 - EDA visualization
 - FFT and DCT frequency-domain visualization
@@ -27,7 +37,7 @@ Part 1 includes:
   - FFT radial power spectrum statistics: 32 dimensions
   - RGB color histogram: 96 dimensions
 - Total feature vector: 1152 dimensions
-- ML classifiers:
+- Traditional ML classifiers:
   - Logistic Regression
   - LinearSVC
   - XGBoost
@@ -37,28 +47,71 @@ Part 1 includes:
   - Gaussian blur: sigma 1, 2, 3
   - Gaussian noise: sigma 0.05, 0.10, 0.20
 
-## New Task
+Known note:
+- If any notebook comment says FFT features are 64 dimensions, treat that as incorrect.
+- The expected FFT feature dimension is 32.
 
-Implement Part 2:
+---
+
+## New Work: Part 2 Deep Learning Baseline
+
+The main task for this repository is to implement Part 2:
+
 - ResNet-18 deep learning baseline
 - Clean test evaluation
-- Robustness evaluation using the same corruption settings
-- Final comparison with Logistic Regression, LinearSVC, XGBoost, and ResNet-18
+- Robustness evaluation using the same corruption settings as Part 1
+- Final comparison among:
+  - Logistic Regression
+  - LinearSVC
+  - XGBoost
+  - ResNet-18
 
-## Coding Rules
+The comparison must be fair. Use the same test images and the same robustness settings whenever possible.
 
-- Do not overwrite the original notebook.
-- Keep the original notebook under `notebooks/`.
+---
+
+## Repository Rules
+
+- Do not overwrite or refactor `notebooks/ML_GW_part1.ipynb`.
 - Put new Python code under `src/`.
-- Make paths configurable.
-- Do not hardcode local paths.
-- Do not upload or commit the Kaggle dataset.
-- Add `--fast_dev_run` mode for quick debugging.
-- Save metrics as CSV.
-- Save plots as PNG.
-- Use random seed 42.
-- Use GPU if available.
-- Keep code readable for a university group project.
+- Do not commit the CIFAKE dataset.
+- Do not commit model checkpoints or large generated outputs.
+- Do not hardcode local machine paths.
+- Make all important paths configurable through CLI arguments.
+- Use random seed 42 where possible.
+- Use GPU if available, but the code must also run on CPU.
+- Save metrics as CSV files.
+- Save plots as PNG files.
+- Keep the code readable for a university group project.
+- Prefer simple, reliable code over overly complex abstractions.
+
+---
+
+## Dataset Path Rules
+
+The code should support a configurable `--data_dir`.
+
+Expected CIFAKE folder structure:
+
+```text
+<data_dir>/
+├── train/
+│   ├── REAL/
+│   └── FAKE/
+└── test/
+    ├── REAL/
+    └── FAKE/
+```
+
+The code may mention this Kaggle path as an example only:
+
+```text
+/kaggle/input/cifake-real-and-ai-generated-synthetic-images/CIFAKE
+```
+
+Do not hardcode this path as the only usable path.
+
+---
 
 ## Expected Project Structure
 
@@ -77,6 +130,7 @@ cifake-detection-project/
 │   └── workflow.jpg
 │
 ├── src/
+│   ├── __init__.py
 │   ├── config.py
 │   ├── data.py
 │   ├── corruptions.py
@@ -89,9 +143,197 @@ cifake-detection-project/
 │   └── utils.py
 │
 ├── outputs/
-│   ├── ml_baseline/
 │   ├── resnet18/
 │   └── final_comparison/
 │
 └── report/
     └── results_summary.md
+```
+
+The `outputs/` folder should be ignored by git.
+
+---
+
+## ResNet-18 Requirements
+
+Use `torchvision.models.resnet18`.
+
+Because CIFAKE images are 32x32, modify ResNet-18 for small images:
+
+- `conv1`: kernel_size=3, stride=1, padding=1
+- `maxpool`: replace with `torch.nn.Identity()`
+- final `fc`: output 2 classes
+
+Training requirements:
+- Use `CrossEntropyLoss`.
+- Use REAL = 0 and FAKE = 1.
+- Split training data into train and validation sets.
+- Select the best checkpoint by validation F1.
+- Do not use the test set for model selection or hyperparameter tuning.
+
+---
+
+## Robustness Evaluation Requirements
+
+Use the exact same corruption settings as Part 1.
+
+JPEG compression:
+- quality = 75
+- quality = 50
+- quality = 25
+
+Gaussian blur:
+- sigma = 1
+- sigma = 2
+- sigma = 3
+
+Gaussian noise:
+- sigma = 0.05
+- sigma = 0.10
+- sigma = 0.20
+
+Rules:
+- Evaluate robustness only after training.
+- Do not train on corrupted images unless the user explicitly asks.
+- Use the same test images for clean and corrupted evaluation.
+- Compute accuracy drop as:
+
+```text
+drop = clean_accuracy - corrupted_accuracy
+```
+
+---
+
+## Required CLI Arguments
+
+Training and evaluation scripts should support these arguments when relevant:
+
+```text
+--data_dir
+--output_dir
+--epochs
+--batch_size
+--learning_rate
+--num_workers
+--max_train_each
+--max_test_each
+--fast_dev_run
+--seed
+```
+
+`--fast_dev_run` should use a very small subset so the scripts can run quickly without full training.
+
+---
+
+## Expected Outputs
+
+ResNet-18 clean evaluation:
+
+```text
+outputs/resnet18/best_resnet18.pth
+outputs/resnet18/training_log.csv
+outputs/resnet18/resnet18_clean_results.csv
+outputs/resnet18/resnet18_confusion_matrix.png
+```
+
+ResNet-18 robustness evaluation:
+
+```text
+outputs/resnet18/resnet18_robustness_results.csv
+```
+
+Final comparison:
+
+```text
+outputs/final_comparison/model_comparison_clean.csv
+outputs/final_comparison/robustness_curves_all_models.png
+outputs/final_comparison/drop_heatmap_all_models.png
+```
+
+Do not commit `.pth`, `.pt`, `.ckpt`, `outputs/`, `data/`, or `datasets/`.
+
+---
+
+## Setup Commands
+
+Use this command when checking the project locally or in a Codex environment:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+If full PyTorch installation fails in the Codex environment, still complete the code changes and run lightweight import checks where possible.
+
+---
+
+## Smoke Test Commands
+
+Before finishing a coding task, try to run the most relevant checks.
+
+Basic import check:
+
+```bash
+python -m compileall src
+```
+
+Fast development training check:
+
+```bash
+python -m src.train_resnet18 --fast_dev_run
+```
+
+Fast development evaluation check:
+
+```bash
+python -m src.eval_resnet18 --fast_dev_run
+```
+
+Fast robustness check:
+
+```bash
+python -m src.eval_resnet18_robustness --fast_dev_run
+```
+
+If the CIFAKE dataset is not available in the environment, do not fail the whole task. Instead:
+- Ensure the code imports correctly.
+- Ensure CLI help works.
+- Clearly report that full training requires the Kaggle dataset.
+
+Useful CLI help checks:
+
+```bash
+python -m src.train_resnet18 --help
+python -m src.eval_resnet18 --help
+python -m src.eval_resnet18_robustness --help
+```
+
+---
+
+## Coding Style
+
+- Use clear function names.
+- Add docstrings for public functions.
+- Keep scripts modular.
+- Avoid unnecessary global variables.
+- Use `pathlib.Path` for file paths.
+- Use `tqdm` for long loops when useful.
+- Use `pandas` for saving CSV results.
+- Use `matplotlib` for plots.
+- Avoid silently swallowing exceptions.
+- Print clear progress messages during training and evaluation.
+
+---
+
+## Review Guidelines
+
+When reviewing changes, check:
+
+- The original notebook is unchanged.
+- Dataset paths are configurable.
+- REAL = 0 and FAKE = 1 are consistent.
+- Test data is not used for training or validation.
+- Robustness parameters match Part 1 exactly.
+- ResNet-18 is adapted for 32x32 images.
+- Results are saved to the expected paths.
+- Large files are not committed.
+- `--fast_dev_run` exists and runs quickly.
