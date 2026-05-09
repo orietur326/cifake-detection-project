@@ -1,261 +1,327 @@
-"""Reproducible Part 1 traditional ML baselines for CIFAKE.
+"""Run Part 1 traditional ML baselines for CIFAKE.
 
 Pipeline:
-- Load CIFAKE train/test images
-- Extract handcrafted features (DCT + FFT radial + RGB histogram)
-- Train Logistic Regression, LinearSVC, and XGBoost
-- Evaluate clean and corrupted robustness performance
+1) Load CIFAKE train/test images.
+2) Extract handcrafted features (DCT + FFT radial stats + RGB histogram).
+3) Fit StandardScaler on training features only.
+4) Train LogisticRegression, LinearSVC, and XGBoost.
+5) Evaluate clean test and robustness under JPEG/blur/noise corruptions.
+6) Save CSVs and plots for report usage.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
+import random
 from pathlib import Path
 from typing import Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
-from PIL import Image
+from PIL import Image, ImageFilter
+from scipy.fftpack import dct
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import ConfusionMatrixDisplay, accuracy_score, confusion_matrix, f1_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
-from tqdm import tqdm
-from xgboost import XGBClassifier
 
-from .config import DEFAULT_SEED, GAUSSIAN_BLUR_SIGMAS, GAUSSIAN_NOISE_SIGMAS, JPEG_QUALITIES
-from .corruptions import apply_gaussian_blur, apply_gaussian_noise, apply_jpeg_compression
-from .data import load_cifake_samples
-from .utils import ensure_dir, set_seed
+try:
+    from xgboost import XGBClassifier
+except Exception as exc:  # pragma: no cover
+    XGBClassifier = None
+    XGB_IMPORT_ERROR = exc
+else:
+    XGB_IMPORT_ERROR = None
+
+IMG_SIZE = 32
+REAL_LABEL = 0
+FAKE_LABEL = 1
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run CIFAKE Part 1 traditional ML baselines.")
-    parser.add_argument("--data_dir", type=Path, required=True, help="Path to CIFAKE root directory.")
+    parser = argparse.ArgumentParser(description="Run CIFAKE traditional ML baselines.")
+    parser.add_argument("--data_dir", type=Path, required=True, help="CIFAKE root directory.")
     parser.add_argument("--output_dir", type=Path, default=Path("outputs/ml_baseline"))
     parser.add_argument("--max_train_each", type=int, default=None)
     parser.add_argument("--max_test_each", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fast_dev_run", action="store_true")
     return parser.parse_args()
 
 
-def load_rgb_array(image_path: Path, transform: Callable[[Image.Image], Image.Image] | None = None) -> np.ndarray:
-    image = Image.open(image_path).convert("RGB")
-    if transform is not None:
-        image = transform(image)
-    return np.asarray(image, dtype=np.float32)
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
 
 
-def rgb_to_gray(rgb: np.ndarray) -> np.ndarray:
-    return (0.2989 * rgb[:, :, 0] + 0.5870 * rgb[:, :, 1] + 0.1140 * rgb[:, :, 2]).astype(np.float32)
+def _take_paths(folder: Path, max_count: int | None) -> list[Path]:
+    paths = sorted(folder.glob("*.jpg"))
+    if max_count is not None:
+        return paths[:max_count]
+    return paths
 
 
-def dct_features(rgb: np.ndarray) -> np.ndarray:
-    gray = rgb_to_gray(rgb)
-    n = gray.shape[0]
-    k = np.arange(n)[:, None]
-    i = np.arange(n)[None, :]
-    basis = np.cos(np.pi * (2 * i + 1) * k / (2 * n)).astype(np.float32)
-    alpha = np.ones((n, 1), dtype=np.float32) * np.sqrt(2.0 / n)
-    alpha[0, 0] = np.sqrt(1.0 / n)
-    c = alpha * basis
-    coeffs = c @ gray @ c.T
-    return coeffs.flatten()  # 32*32 = 1024
+def load_class_images(folder: Path, label: int, max_count: int | None) -> tuple[list[np.ndarray], np.ndarray]:
+    paths = _take_paths(folder, max_count)
+    images: list[np.ndarray] = []
+    labels = np.full(len(paths), label, dtype=np.int64)
+    for path in paths:
+        arr = np.array(Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE)), dtype=np.uint8)
+        images.append(arr)
+    return images, labels
 
 
-def fft_radial_features(rgb: np.ndarray, n_bins: int = 32) -> np.ndarray:
-    gray = rgb_to_gray(rgb)
-    fft = np.fft.fft2(gray)
-    fft_shift = np.fft.fftshift(fft)
-    power = np.abs(fft_shift) ** 2
-
-    h, w = power.shape
-    cy, cx = h // 2, w // 2
-    y, x = np.indices((h, w))
-    r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-    r = np.clip(r.astype(np.int32), 0, n_bins - 1)
-
-    radial_sum = np.bincount(r.ravel(), weights=power.ravel(), minlength=n_bins)
-    radial_count = np.bincount(r.ravel(), minlength=n_bins)
-    radial_mean = radial_sum / np.maximum(radial_count, 1)
-    radial_log = np.log1p(radial_mean)
-    return radial_log.astype(np.float32)  # 32 dims
+def extract_dct_features(img: np.ndarray) -> np.ndarray:
+    gray = np.mean(img, axis=2).astype(np.float32) / 255.0
+    coeff = dct(dct(gray.T, norm="ortho").T, norm="ortho")
+    return coeff.flatten()
 
 
-def rgb_hist_features(rgb: np.ndarray, bins: int = 32) -> np.ndarray:
-    feats = []
+def extract_fft_features(img: np.ndarray) -> np.ndarray:
+    gray = np.mean(img, axis=2).astype(np.float32) / 255.0
+    freq = np.fft.fftshift(np.fft.fft2(gray))
+    mag = np.log1p(np.abs(freq))
+
+    cy, cx = IMG_SIZE // 2, IMG_SIZE // 2
+    y, x = np.ogrid[:IMG_SIZE, :IMG_SIZE]
+    radius = np.sqrt((x - cx) ** 2 + (y - cy) ** 2).astype(int)
+    n_bins = IMG_SIZE // 2
+    feats = np.zeros(n_bins * 2, dtype=np.float32)
+    for r in range(n_bins):
+        vals = mag[radius == r]
+        if len(vals):
+            feats[r] = vals.mean()
+            feats[r + n_bins] = vals.std()
+    return feats
+
+
+def extract_color_hist(img: np.ndarray, bins: int = 32) -> np.ndarray:
+    parts = []
     for c in range(3):
-        hist, _ = np.histogram(rgb[:, :, c], bins=bins, range=(0, 256), density=True)
-        feats.append(hist.astype(np.float32))
-    return np.concatenate(feats, axis=0)  # 96 dims
+        hist, _ = np.histogram(img[:, :, c], bins=bins, range=(0, 256))
+        parts.append(hist / max(hist.sum(), 1))
+    return np.concatenate(parts).astype(np.float32)
 
 
-def extract_features_for_paths(paths: list[Path], transform: Callable[[Image.Image], Image.Image] | None = None) -> np.ndarray:
-    rows = []
-    for p in tqdm(paths, desc="extract_features", leave=False):
-        rgb = load_rgb_array(p, transform=transform)
-        feats = np.concatenate([dct_features(rgb), fft_radial_features(rgb), rgb_hist_features(rgb)])
-        rows.append(feats)
-    return np.vstack(rows).astype(np.float32)
+def extract_features(images: list[np.ndarray]) -> np.ndarray:
+    feats = []
+    for img in images:
+        feats.append(np.concatenate([extract_dct_features(img), extract_fft_features(img), extract_color_hist(img)]))
+    return np.asarray(feats, dtype=np.float32)
 
 
-def build_models(seed: int) -> dict[str, object]:
-    return {
-        "LogisticRegression": LogisticRegression(max_iter=1000, random_state=seed),
-        "LinearSVC": LinearSVC(random_state=seed, max_iter=5000),
-        "XGBoost": XGBClassifier(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=6,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            objective="binary:logistic",
-            eval_metric="logloss",
-            random_state=seed,
-            n_jobs=-1,
-        ),
-    }
+def corrupt_jpeg(images: list[np.ndarray], quality: int) -> list[np.ndarray]:
+    out = []
+    for arr in images:
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="JPEG", quality=quality)
+        buf.seek(0)
+        out.append(np.array(Image.open(buf).convert("RGB"), dtype=np.uint8))
+    return out
 
 
-def evaluate_clean(models: dict[str, object], x_train: np.ndarray, y_train: np.ndarray, x_test: np.ndarray, y_test: np.ndarray):
-    clean_rows = []
-    preds = {}
-    for name, model in models.items():
-        print(f"Training {name}...")
-        model.fit(x_train, y_train)
-        y_pred = model.predict(x_test)
-        preds[name] = y_pred
-        clean_rows.append(
-            {
-                "model": name,
-                "accuracy": accuracy_score(y_test, y_pred),
-                "f1": f1_score(y_test, y_pred, average="binary"),
-            }
-        )
-    return pd.DataFrame(clean_rows), preds
+def corrupt_blur(images: list[np.ndarray], sigma: float) -> list[np.ndarray]:
+    return [np.array(Image.fromarray(arr).filter(ImageFilter.GaussianBlur(radius=sigma)), dtype=np.uint8) for arr in images]
 
 
-def plot_confusion_matrices(y_true: np.ndarray, preds: dict[str, np.ndarray], output_path: Path) -> None:
-    fig, axes = plt.subplots(1, len(preds), figsize=(15, 4))
-    for ax, (name, y_pred) in zip(axes, preds.items()):
-        cm = confusion_matrix(y_true, y_pred)
-        ConfusionMatrixDisplay(cm, display_labels=["REAL", "FAKE"]).plot(ax=ax, cmap="Blues", colorbar=False)
-        ax.set_title(name)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def evaluate_robustness(models, scaler, test_paths, y_test, clean_acc_by_model):
-    settings = {
-        "jpeg": JPEG_QUALITIES,
-        "gaussian_blur": GAUSSIAN_BLUR_SIGMAS,
-        "gaussian_noise": GAUSSIAN_NOISE_SIGMAS,
-    }
-    transforms = {
-        "jpeg": lambda lvl: (lambda img: apply_jpeg_compression(img, int(lvl))),
-        "gaussian_blur": lambda lvl: (lambda img: apply_gaussian_blur(img, float(lvl))),
-        "gaussian_noise": lambda lvl: (lambda img: apply_gaussian_noise(img, float(lvl))),
-    }
-
-    rows = []
-    for corr_name, levels in settings.items():
-        for level in levels:
-            print(f"Evaluating corruption={corr_name} level={level}")
-            x_corr = extract_features_for_paths(test_paths, transform=transforms[corr_name](level))
-            x_corr = scaler.transform(x_corr)
-            for model_name, model in models.items():
-                y_pred = model.predict(x_corr)
-                acc = accuracy_score(y_test, y_pred)
-                rows.append(
-                    {
-                        "model": model_name,
-                        "corruption": corr_name,
-                        "severity": level,
-                        "accuracy": acc,
-                        "f1": f1_score(y_test, y_pred, average="binary"),
-                        "clean_accuracy": clean_acc_by_model[model_name],
-                        "accuracy_drop": clean_acc_by_model[model_name] - acc,
-                    }
-                )
-    return pd.DataFrame(rows)
-
-
-def plot_robustness_curves(df_robust: pd.DataFrame, output_path: Path) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4), sharey=True)
-    for ax, corr in zip(axes, ["jpeg", "gaussian_blur", "gaussian_noise"]):
-        d = df_robust[df_robust["corruption"] == corr].copy()
-        for model in d["model"].unique():
-            dm = d[d["model"] == model].sort_values("severity")
-            ax.plot(dm["severity"], dm["accuracy"], marker="o", label=model)
-        ax.set_title(corr)
-        ax.set_xlabel("severity")
-        ax.grid(alpha=0.25)
-    axes[0].set_ylabel("accuracy")
-    axes[-1].legend(loc="best")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def plot_drop_heatmap(df_robust: pd.DataFrame, output_path: Path) -> None:
-    df = df_robust.copy()
-    df["setting"] = df["corruption"] + "_" + df["severity"].astype(str)
-    piv = df.pivot_table(index="model", columns="setting", values="accuracy_drop")
-    plt.figure(figsize=(12, 4))
-    sns.heatmap(piv, annot=True, fmt=".3f", cmap="Reds")
-    plt.title("Accuracy Drop vs Clean")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=180)
-    plt.close()
+def corrupt_noise(images: list[np.ndarray], sigma: float) -> list[np.ndarray]:
+    out = []
+    for arr in images:
+        noise = np.random.normal(0, sigma * 255, arr.shape)
+        noisy = np.clip(arr.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        out.append(noisy)
+    return out
 
 
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
-    out_dir = ensure_dir(args.output_dir)
 
-    train_samples, test_samples = load_cifake_samples(
-        args.data_dir,
-        max_train_each=args.max_train_each,
-        max_test_each=args.max_test_each,
-        seed=args.seed,
-        fast_dev_run=args.fast_dev_run,
-    )
     if args.fast_dev_run:
-        train_samples = train_samples[: min(40, len(train_samples))]
-        test_samples = test_samples[: min(40, len(test_samples))]
+        max_train_each = 64
+        max_test_each = 32
+        print("[fast_dev_run] Enabled: using small subset for quick checks.")
+    else:
+        max_train_each = args.max_train_each
+        max_test_each = args.max_test_each
 
-    train_paths = [s.image_path for s in train_samples]
-    y_train = np.array([s.label for s in train_samples], dtype=np.int64)
-    test_paths = [s.image_path for s in test_samples]
-    y_test = np.array([s.label for s in test_samples], dtype=np.int64)
+    train_real = args.data_dir / "train" / "REAL"
+    train_fake = args.data_dir / "train" / "FAKE"
+    test_real = args.data_dir / "test" / "REAL"
+    test_fake = args.data_dir / "test" / "FAKE"
 
-    print("Extracting clean train features...")
-    x_train = extract_features_for_paths(train_paths)
-    print("Extracting clean test features...")
-    x_test = extract_features_for_paths(test_paths)
+    print("[1/7] Loading image paths and images...")
+    tr_real, y_tr_real = load_class_images(train_real, REAL_LABEL, max_train_each)
+    tr_fake, y_tr_fake = load_class_images(train_fake, FAKE_LABEL, max_train_each)
+    te_real, y_te_real = load_class_images(test_real, REAL_LABEL, max_test_each)
+    te_fake, y_te_fake = load_class_images(test_fake, FAKE_LABEL, max_test_each)
 
+    x_train_images = tr_real + tr_fake
+    y_train = np.concatenate([y_tr_real, y_tr_fake])
+    x_test_images = te_real + te_fake
+    y_test = np.concatenate([y_te_real, y_te_fake])
+    print(f"Loaded train={len(x_train_images)}, test={len(x_test_images)} images")
+
+    print("[2/7] Extracting handcrafted features...")
+    x_train = extract_features(x_train_images)
+    x_test = extract_features(x_test_images)
+    print(f"Feature shapes: train={x_train.shape}, test={x_test.shape}")
+
+    print("[3/7] Fitting StandardScaler on training features only...")
     scaler = StandardScaler()
-    x_train_sc = scaler.fit_transform(x_train)
-    x_test_sc = scaler.transform(x_test)
+    x_train_scaled = scaler.fit_transform(x_train)
+    x_test_scaled = scaler.transform(x_test)
 
-    models = build_models(args.seed)
-    clean_df, preds = evaluate_clean(models, x_train_sc, y_train, x_test_sc, y_test)
-    clean_csv = out_dir / "ml_clean_results.csv"
-    clean_df.to_csv(clean_csv, index=False)
-    plot_confusion_matrices(y_test, preds, out_dir / "confusion_matrices_clean.png")
+    print("[4/7] Training models...")
+    if XGBClassifier is None:
+        raise ImportError(f"xgboost is required for this script: {XGB_IMPORT_ERROR}")
 
-    clean_acc = {row["model"]: row["accuracy"] for _, row in clean_df.iterrows()}
-    robust_df = evaluate_robustness(models, scaler, test_paths, y_test, clean_acc)
-    robust_df.to_csv(out_dir / "ml_robustness_results.csv", index=False)
-    plot_robustness_curves(robust_df, out_dir / "robustness_curves.png")
-    plot_drop_heatmap(robust_df, out_dir / "drop_heatmap.png")
+    models = {
+        "Logistic Regression": LogisticRegression(max_iter=1000, C=1.0, random_state=args.seed, n_jobs=-1),
+        "LinearSVC": CalibratedClassifierCV(LinearSVC(max_iter=2000, C=1.0, random_state=args.seed)),
+        "XGBoost": XGBClassifier(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric="logloss",
+            random_state=args.seed,
+            n_jobs=-1,
+            verbosity=0,
+        ),
+    }
 
-    print(f"Saved outputs to: {out_dir}")
+    clean_records = []
+    preds_clean: dict[str, np.ndarray] = {}
+    for name, model in models.items():
+        print(f"  - training {name}")
+        x_train_used = x_train_scaled if name != "XGBoost" else x_train
+        x_test_used = x_test_scaled if name != "XGBoost" else x_test
+        model.fit(x_train_used, y_train)
+        preds = model.predict(x_test_used)
+        preds_clean[name] = preds
+        clean_records.append(
+            {
+                "model": name,
+                "accuracy": accuracy_score(y_test, preds),
+                "f1": f1_score(y_test, preds),
+            }
+        )
+
+    print("[5/7] Evaluating clean test set and plotting confusion matrices...")
+    clean_df = pd.DataFrame(clean_records).sort_values("model")
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    for ax, name in zip(axes, models.keys()):
+        cm = confusion_matrix(y_test, preds_clean[name], labels=[REAL_LABEL, FAKE_LABEL])
+        ConfusionMatrixDisplay(cm, display_labels=["REAL", "FAKE"]).plot(ax=ax, colorbar=False)
+        acc = clean_df.loc[clean_df["model"] == name, "accuracy"].iloc[0]
+        ax.set_title(f"{name}\nacc={acc:.4f}")
+
+    print("[6/7] Evaluating robustness under JPEG / blur / noise...")
+    corruptions: dict[str, list[tuple[Callable, float | int, str]]] = {
+        "JPEG quality": [(corrupt_jpeg, 75, "q=75"), (corrupt_jpeg, 50, "q=50"), (corrupt_jpeg, 25, "q=25")],
+        "Gaussian blur": [(corrupt_blur, 1, "σ=1"), (corrupt_blur, 2, "σ=2"), (corrupt_blur, 3, "σ=3")],
+        "Gaussian noise": [
+            (corrupt_noise, 0.05, "σ=0.05"),
+            (corrupt_noise, 0.10, "σ=0.10"),
+            (corrupt_noise, 0.20, "σ=0.20"),
+        ],
+    }
+
+    clean_acc = {r["model"]: r["accuracy"] for r in clean_records}
+    robustness_rows = []
+
+    for corruption_name, levels in corruptions.items():
+        print(f"  - {corruption_name}")
+        for fn, param, label in levels:
+            x_corrupt = extract_features(fn(x_test_images, param))
+            x_corrupt_scaled = scaler.transform(x_corrupt)
+            for name, model in models.items():
+                x_used = x_corrupt_scaled if name != "XGBoost" else x_corrupt
+                acc = accuracy_score(y_test, model.predict(x_used))
+                drop = clean_acc[name] - acc
+                robustness_rows.append(
+                    {
+                        "model": name,
+                        "corruption": corruption_name,
+                        "level": label,
+                        "accuracy": acc,
+                        "drop": drop,
+                    }
+                )
+
+    robustness_df = pd.DataFrame(robustness_rows)
+    avg_drop_df = (
+        robustness_df.groupby(["model", "corruption"], as_index=False)["drop"]
+        .mean()
+        .rename(columns={"drop": "avg_drop"})
+        .sort_values(["model", "corruption"])
+    )
+
+    print("[7/7] Saving outputs...")
+    output_dir = args.output_dir
+    report_data_dir = Path("report/data")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_data_dir.mkdir(parents=True, exist_ok=True)
+
+    clean_path = output_dir / "ml_clean_results.csv"
+    robustness_path = output_dir / "ml_robustness_results.csv"
+    avg_drop_path = output_dir / "ml_avg_robustness_drop.csv"
+    cm_path = output_dir / "confusion_matrices_clean.png"
+    robustness_plot_path = output_dir / "robustness_curves.png"
+    heatmap_path = output_dir / "drop_heatmap.png"
+
+    clean_df.to_csv(clean_path, index=False)
+    robustness_df.to_csv(robustness_path, index=False)
+    avg_drop_df.to_csv(avg_drop_path, index=False)
+    fig.tight_layout()
+    fig.savefig(cm_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig2, axes2 = plt.subplots(1, 3, figsize=(15, 5), sharey=False)
+    for ax, corruption_name in zip(axes2, corruptions.keys()):
+        levels = [x[2] for x in corruptions[corruption_name]]
+        for name in models.keys():
+            sub = robustness_df[(robustness_df["model"] == name) & (robustness_df["corruption"] == corruption_name)]
+            series = sub.set_index("level").loc[levels, "accuracy"].values
+            ax.plot(levels, series, marker="o", label=name)
+            ax.axhline(clean_acc[name], linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.set_title(corruption_name)
+        ax.set_xlabel("Corruption level")
+        ax.set_ylabel("Accuracy")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+    fig2.tight_layout()
+    fig2.savefig(robustness_plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig2)
+
+    pivot = robustness_df.pivot_table(index="model", columns=["corruption", "level"], values="drop")
+    fig3, ax3 = plt.subplots(figsize=(13, 3))
+    im = ax3.imshow(pivot.values, cmap="Reds", aspect="auto", vmin=0)
+    ax3.set_xticks(range(len(pivot.columns)))
+    ax3.set_xticklabels([f"{a}\n{b}" for a, b in pivot.columns], fontsize=8)
+    ax3.set_yticks(range(len(pivot.index)))
+    ax3.set_yticklabels(pivot.index, fontsize=9)
+    for i in range(len(pivot.index)):
+        for j in range(len(pivot.columns)):
+            v = pivot.values[i, j]
+            ax3.text(j, i, f"{v:.3f}", ha="center", va="center", fontsize=8)
+    fig3.colorbar(im, ax=ax3, label="Accuracy drop")
+    fig3.tight_layout()
+    fig3.savefig(heatmap_path, dpi=150, bbox_inches="tight")
+    plt.close(fig3)
+
+    clean_df.to_csv(report_data_dir / "ml_clean_results.csv", index=False)
+    avg_drop_df.to_csv(report_data_dir / "ml_avg_robustness_drop.csv", index=False)
+
+    print(f"Saved: {clean_path}")
+    print(f"Saved: {robustness_path}")
+    print(f"Saved: {avg_drop_path}")
 
 
 if __name__ == "__main__":
